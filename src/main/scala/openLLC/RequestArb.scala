@@ -22,6 +22,10 @@ import chisel3.util._
 import org.chipsalliance.cde.config.Parameters
 import coupledL2.tl2chi.HasCHIOpcodes
 import scala.math.min
+import freechips.rocketchip.diplomacy._
+import chisel3.experimental.noPrefix
+import my_utils.DebugUtils._
+
 
 class RequestArb(implicit p: Parameters) extends LLCModule with HasClientInfo with HasCHIOpcodes {
   val io = IO(new Bundle() {
@@ -61,12 +65,61 @@ class RequestArb(implicit p: Parameters) extends LLCModule with HasClientInfo wi
   val tag_s1   = task_s1.bits.tag
   val set_s1   = task_s1.bits.set
   val reqID_s1 = task_s1.bits.reqID
+  val potentialCount = PopCount(pipeInfo.valids)
 
-  val isReadNotSharedDirty_s1 = !task_s1.bits.refillTask && task_s1.bits.chiOpcode === ReadNotSharedDirty
-  val isReadUnique_s1 = !task_s1.bits.refillTask && task_s1.bits.chiOpcode === ReadUnique
-  val isCleanInvalid_s1 = !task_s1.bits.refillTask && task_s1.bits.chiOpcode === CleanInvalid
-  val isCleanShared_s1 = !task_s1.bits.refillTask && task_s1.bits.chiOpcode === CleanShared
-  val isWriteCleanFull_s1 = !task_s1.bits.refillTask && task_s1.bits.chiOpcode === WriteCleanFull
+  val isBusTask = !task_s1.bits.refillTask
+  val isRefillTask = task_s1.bits.refillTask
+
+  def addrConnect(lset: UInt, ltag: UInt, rset: UInt, rtag: UInt) = {
+    assert(lset.getWidth + ltag.getWidth == rset.getWidth + rtag.getWidth)
+    val addr = Cat(rtag, rset)
+    lset := addr.tail(ltag.getWidth)
+    ltag := addr.head(ltag.getWidth)
+  }
+
+
+  private def checkAddrMatch[T<:Data](info: Seq[ValidIO[T]], task_tag: UInt, task_set: UInt)
+                            (getTag: T => UInt, getSet: T => UInt) // getter
+                            (implicit vn: ValName): Bool = {
+    val checker = info.map(e => e.valid &&(getTag(e.bits) === task_tag) && (getSet(e.bits) === task_set))
+    val res = WireDefault(VecInit(checker).asUInt.orR).suggestName(vn.name)
+    dontTouch(res)
+    res
+  }
+
+  private def checkAddrOpMatch[T<:Data](info: Seq[ValidIO[T]], task_tag: UInt, task_set: UInt)
+                            (getTag: T => UInt, getSet: T => UInt, getOpcode:T=>UInt, getWdatRsp: T=>UInt) // getter
+                            (implicit vn: ValName): Bool = {
+    val checker = info.map(e => e.valid && (getTag(e.bits) === task_tag) && (getSet(e.bits) === task_set) && 
+     getOpcode(e.bits) === WriteNoSnpFull && (isRefillTask || isClean_s1 || !getWdatRsp(e.bits) && isRead_s1))
+    val res = WireDefault(VecInit(checker).asUInt.orR).suggestName(vn.name)
+    dontTouch(res)
+    res
+  }
+
+  private def checkReqIDMatch[T<:Data](info: Seq[ValidIO[T]], task_reqID: UInt)
+                          (getReqID:T=>UInt)
+                          (implicit vn: ValName): Bool = {
+    val checker = info.map(e => e.valid && getReqID(e.bits) === task_reqID)
+    val res = WireDefault(VecInit(checker).asUInt.orR).suggestName(vn.name)
+    dontTouch(res)
+    res
+  }
+
+  private def checkMSHRFull(inflight: UInt, potential: UInt, mshr: UInt)(implicit vn: ValName): Bool = {
+    val full = inflight >= mshr
+    val room    = Mux(full, 0.U, mshr - inflight) 
+    val res = WireDefault(full || (room <= potential)).suggestName(vn.name)
+    dontTouch(res)
+    res
+
+  }
+
+  val isReadNotSharedDirty_s1 = isBusTask && task_s1.bits.chiOpcode === ReadNotSharedDirty
+  val isReadUnique_s1 = isBusTask && task_s1.bits.chiOpcode === ReadUnique
+  val isCleanInvalid_s1 = isBusTask && task_s1.bits.chiOpcode === CleanInvalid
+  val isCleanShared_s1 = isBusTask && task_s1.bits.chiOpcode === CleanShared
+  val isWriteCleanFull_s1 = isBusTask && task_s1.bits.chiOpcode === WriteCleanFull
 
   val isRead_s1  = isReadNotSharedDirty_s1 || isReadUnique_s1
   val isClean_s1 = isCleanInvalid_s1 || isCleanShared_s1 || isWriteCleanFull_s1
@@ -94,29 +147,65 @@ class RequestArb(implicit p: Parameters) extends LLCModule with HasClientInfo wi
   val inflight_snoop     = PopCount(snpInfo.map(e => e.valid))
   val inflight_response  = PopCount(respInfo.map(e => e.valid))
   val inflight_memAccess = PopCount(memInfo.map(e => e.valid))
-  val potential_refill, potential_snoop = PopCount(Seq(pipeInfo.s2_valid, pipeInfo.s3_valid, pipeInfo.s4_valid))
-  val potential_response, potential_memAccess = PopCount(pipeInfo.valids)
+  val potential_refill = Wire(UInt())
+  dontTouch(potential_refill)
+  val pipeInfo_s2_valid = keep(pipeInfo.s2_valid)
+  val pipeInfo_s3_valid = keep(pipeInfo.s3_valid)
+  val pipeInfo_s4_valid = keep(pipeInfo.s4_valid)
+  potential_refill := PopCount(Cat(pipeInfo_s2_valid, pipeInfo_s3_valid, pipeInfo_s4_valid))
+  val potential_response = keep(potentialCount)
+  val potential_memAccess = keep(potentialCount)
 
-  val blockByMainPipe = sameSet_s2 || sameSet_s3 || sameSet_s4 || sameAddr_s5 || sameAddr_s6 ||
-    sameReqID_s2 || sameReqID_s3 || sameReqID_s4 || sameReqID_s5 || sameReqID_s6
-  val blockByRefill = !task_s1.bits.refillTask && (
-    Cat(refillInfo.map(e => e.valid && Cat(e.bits.tag, e.bits.set) === Cat(tag_s1, set_s1))).orR ||
-    Cat(refillInfo.map(e => e.valid && e.bits.reqID === reqID_s1)).orR ||
-    (inflight_refill +& potential_refill) >= mshrs.refill.U
-  )
-  val blockByResp = !task_s1.bits.refillTask && (
-    Cat(respInfo.map(e => e.valid && Cat(e.bits.tag, e.bits.set) === Cat(tag_s1, set_s1))).orR ||
-    Cat(respInfo.map(e => e.valid && e.bits.reqID === reqID_s1)).orR ||
-    (inflight_response +& potential_response) >= mshrs.response.U
-  )
-  val blockBySnp = !task_s1.bits.refillTask && (
-    Cat(snpInfo.map(e => e.valid && e.bits.reqID === reqID_s1)).orR ||
-    (inflight_snoop +& potential_snoop) >= mshrs.snoop.U
-  )
-  val blockByMem = Cat(memInfo.map(e => e.valid && Cat(e.bits.tag, e.bits.set) === Cat(tag_s1, set_s1) &&
-    e.bits.opcode === WriteNoSnpFull && (task_s1.bits.refillTask || isClean_s1 || !e.bits.w_datRsp && isRead_s1))).orR ||
-    Cat(memInfo.map(e => e.valid && e.bits.reqID === reqID_s1 && !task_s1.bits.refillTask)).orR ||
-    (inflight_memAccess +& potential_memAccess) >= mshrs.memory.U
+  /* BLOCK BY MAINPIPE */
+  val mainPipeSameSet = sameSet_s2 || sameSet_s3 || sameSet_s4
+  val mainPipeSameAddr = sameAddr_s5 || sameAddr_s6
+  val mainPipeSameReqID = sameReqID_s2 || sameReqID_s3 || sameReqID_s4 || sameReqID_s5 || sameReqID_s6
+  val blockByMainPipe = mainPipeSameSet || mainPipeSameAddr || mainPipeSameReqID
+  // val blockByMainPipe = sameSet_s2 || sameSet_s3 || sameSet_s4 || sameAddr_s5 || sameAddr_s6 ||
+  //   sameReqID_s2 || sameReqID_s3 || sameReqID_s4 || sameReqID_s5 || sameReqID_s6
+  dontTouch(blockByMainPipe)
+  
+  /* BLOCK BY REFILL */
+  val refillTask_condition = isBusTask
+  val refillAddrMatch = checkAddrMatch(refillInfo, tag_s1, set_s1)(_.tag, _.set)
+  val refillReqIDMatch = checkReqIDMatch(refillInfo, reqID_s1)(_.reqID)
+  val refillCapFull = checkMSHRFull(inflight_refill, potential_refill, mshrs.refill.U)
+  val blockByRefill = refillTask_condition && (refillAddrMatch || refillReqIDMatch || refillCapFull)
+  dontTouch(blockByRefill)
+  // val blockByRefill = !task_s1.bits.refillTask && (
+  //   Cat(refillInfo.map(e => e.valid && Cat(e.bits.tag, e.bits.set) === Cat(tag_s1, set_s1))).orR ||
+  //   Cat(refillInfo.map(e => e.valid && e.bits.reqID === reqID_s1)).orR ||
+  //   (inflight_refill +& potential_refill) >= mshrs.refill.U
+  // )
+
+  /* BLOCK BY RESPONSE */
+  val respTask_condition = isBusTask
+  val respAddrMatch = checkAddrMatch(respInfo, tag_s1, set_s1)(_.tag, _.set)
+  val respReqIDMatch = checkReqIDMatch(respInfo, reqID_s1)(_.reqID)
+  val respCapFull = checkMSHRFull(inflight_response, potential_response, mshrs.response.U)
+  val blockByResp = respTask_condition && (respAddrMatch || respReqIDMatch || respCapFull)
+  dontTouch(blockByResp)
+  /* BLOCK BY SNOOP */
+  // val blockByResp = !task_s1.bits.refillTask && (
+  //   Cat(respInfo.map(e => e.valid && Cat(e.bits.tag, e.bits.set) === Cat(tag_s1, set_s1))).orR ||
+  //   Cat(respInfo.map(e => e.valid && e.bits.reqID === reqID_s1)).orR ||
+  //   (inflight_response +& potential_response) >= mshrs.response.U
+  // )
+  
+  // val blockBySnp = !task_s1.bits.refillTask && (
+  //   Cat(snpInfo.map(e => e.valid && e.bits.reqID === reqID_s1)).orR ||
+  //   (inflight_snoop +& potential_snoop) >= mshrs.snoop.U
+  // )
+  /* BLOCK BY MEM */
+  val memAddrOpMatch = checkAddrOpMatch(memInfo, tag_s1, set_s1)(_.tag, _.set, _.opcode, _.w_datRsp)
+  val memReqIDMatch = noPrefix{checkReqIDMatch(memInfo, reqID_s1)(_.reqID) && isBusTask}
+  val memCapFull = checkMSHRFull(inflight_memAccess , potential_memAccess, mshrs.memory.U)
+  val blockByMem = memAddrOpMatch || memReqIDMatch || memCapFull
+  dontTouch(blockByMem)
+  // val blockByMem = Cat(memInfo.map(e => e.valid && Cat(e.bits.tag, e.bits.set) === Cat(tag_s1, set_s1) &&
+  //   e.bits.opcode === WriteNoSnpFull && (task_s1.bits.refillTask || isClean_s1 || !e.bits.w_datRsp && isRead_s1))).orR ||
+  //   Cat(memInfo.map(e => e.valid && e.bits.reqID === reqID_s1 && !task_s1.bits.refillTask)).orR ||
+  //   (inflight_memAccess +& potential_memAccess) >= mshrs.memory.U
 
   val blockEntrance = blockByMainPipe || blockByRefill || blockByResp || blockByMem
 
@@ -126,12 +215,6 @@ class RequestArb(implicit p: Parameters) extends LLCModule with HasClientInfo wi
   io.busTask_s1.ready := io.dirRead_s1.ready && !io.refillTask_s1.valid && !blockEntrance
   io.refillTask_s1.ready := io.dirRead_s1.ready && !blockEntrance
 
-  def addrConnect(lset: UInt, ltag: UInt, rset: UInt, rtag: UInt) = {
-    assert(lset.getWidth + ltag.getWidth == rset.getWidth + rtag.getWidth)
-    val addr = Cat(rtag, rset)
-    lset := addr.tail(ltag.getWidth)
-    ltag := addr.head(ltag.getWidth)
-  }
 
   // Meta read request
   io.dirRead_s1.valid := task_s1.valid
