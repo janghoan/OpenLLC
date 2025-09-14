@@ -75,8 +75,9 @@ class RNLinkMonitor(implicit p: Parameters) extends LLCModule {
   val rxState = RegInit(LinkStates.STOP)
 
   // Record the upstream request node's ID
-  val rnID = RegEnable(rxOut.req.flit.asTypeOf(new CHIREQ()).elements.filter(_._1 == "srcID").head._2,
-    0.U(NODEID_WIDTH.W), rxOut.req.flitv)
+  // Create a dummy CHIREQ instance to get field bit ranges
+  val srcIDRange =  (new CHIREQ()).getFieldBitRange("srcID").get
+  val rnID = RegEnable(rxOut.req.flit(srcIDRange._1, srcIDRange._2), 0.U(NODEID_WIDTH.W), rxOut.req.flitv)
 
   Seq(txState, rxState).zip(MixedVecInit(Seq(txOut, rxOut))).foreach { case (state, link) =>
     state := MuxLookup(Cat(link.linkactivereq, link.linkactiveack), LinkStates.STOP)(Seq(
